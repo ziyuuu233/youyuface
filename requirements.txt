@@ -1,0 +1,13 @@
+# 注意：insightface 预编译 wheel 基于 numpy 1.x ABI，因此 numpy 必须锁定 1.x
+numpy==1.26.4
+opencv-python==4.9.0.80
+# insightface 依赖 albumentations；必须用 1.3.1（1.4+ 会拉入需要 C++ 编译器的 albucore/stringzilla）
+albumentations==1.3.1
+# onnx 依赖 ml_dtypes，新版要求 numpy 2，需锁定 <0.6
+ml_dtypes<0.6
+# 默认 DirectML：Windows 下免装 CUDA Toolkit，NVIDIA/AMD/Intel 显卡均可加速
+onnxruntime-directml==1.21.0
+# 虚拟摄像头推流（需系统已安装 OBS Virtual Camera 或 Unity Capture 驱动）
+pyvirtualcam==0.15.0
+# insightface 官方 PyPI 只有源码包（需 C++ 编译器），这里直接用 Windows py3.11 预编译 wheel
+insightface @ https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl

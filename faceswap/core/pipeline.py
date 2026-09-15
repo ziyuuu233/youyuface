@@ -41,6 +41,10 @@ class LivePipeline:
         virtual_cam: bool = False,
         virtual_cam_fps: float = 30.0,
         on_frame=None,
+        match_skin: bool = True,
+        skin_strength: float = 0.8,
+        process_width: int = 0,
+        skip_frames: bool = True,
     ):
         self.analyser = analyser
         self.swapper = swapper
@@ -54,8 +58,19 @@ class LivePipeline:
         self.virtual_cam = virtual_cam
         self.virtual_cam_fps = virtual_cam_fps
         self.on_frame = on_frame
+        self.match_skin = match_skin
+        self.skin_strength = skin_strength
+        # 处理分辨率：>0 时把帧缩放到该宽度再做人脸检测/换脸，输出再放大回去
+        # 手机流建议设 640，可显著提升帧率
+        self.process_width = process_width
+        # 跳帧：处理不过来时丢弃旧帧，只处理最新帧，降低延迟
+        self.skip_frames = skip_frames
         # 运行时状态，供 GUI 轮询显示
         self.status = {"fps": 0.0, "virtual_cam_active": False}
+        # 内部标记是否为网络流（用于决定是否需要跳帧）
+        self._is_url = isinstance(camera_index, str) and (
+            camera_index.startswith(("http://", "https://", "rtsp://", "rtmp://"))
+        )
 
     @property
     def source_face(self):
@@ -68,13 +83,29 @@ class LivePipeline:
             self._source_face = new_face
 
     def _open_camera(self) -> cv2.VideoCapture:
-        # Windows 用 DSHOW 启动更快；MJPG 保证 720p 下高帧率
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        """打开摄像头。camera_index 支持：
+        - 整数：本地摄像头编号（用 DSHOW，设置分辨率）
+        - 字符串 URL：手机摄像头 App 输出的 HTTP MJPEG / RTSP 流
+        """
+        src = self.camera_index
+        is_url = isinstance(src, str) and (
+            src.startswith(("http://", "https://", "rtsp://", "rtmp://"))
+        )
+
+        if is_url:
+            cap = cv2.VideoCapture(src)
+            # 网络流关键优化：缓冲区只留 1 帧，避免旧帧堆积导致高延迟
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            # 本地摄像头：Windows 用 DSHOW 启动更快；MJPG 保证 720p 下高帧率
+            idx = int(src)
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
         if not cap.isOpened():
-            raise RuntimeError(f"无法打开摄像头 {self.camera_index}")
+            raise RuntimeError(f"无法打开摄像头: {src}")
         return cap
 
     def _open_virtual_cam(self, frame_w: int, frame_h: int):
@@ -101,18 +132,54 @@ class LivePipeline:
         use_gui = self.on_frame is not None
         try:
             while stop_event is None or not stop_event.is_set():
-                ok, frame = cap.read()
+                # 网络流跳帧：丢掉积压的旧帧，只取最新一帧，降低延迟
+                if self._is_url and self.skip_frames:
+                    # grab 多次丢弃缓冲区里的旧帧（grab 只解码不取出，速度快）
+                    for _ in range(2):
+                        if not cap.grab():
+                            break
+                    ok, frame = cap.retrieve()
+                else:
+                    ok, frame = cap.read()
                 if not ok:
                     continue
                 if self.mirror:
                     frame = cv2.flip(frame, 1)
 
+                # 降分辨率处理：缩小后再换脸，输出放大回去（手机流显著提速）
+                orig_h, orig_w = frame.shape[:2]
+                if self.process_width > 0 and orig_w > self.process_width:
+                    scale = self.process_width / orig_w
+                    small = cv2.resize(
+                        frame, (self.process_width, int(orig_h * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    small = frame
+                    scale = 1.0
+
                 t0 = time.perf_counter()
                 src = self.source_face  # 每帧只读一次（带锁），支持热切换
-                for face in get_many_faces(self.analyser, frame):
-                    frame = self.swapper.swap(frame, src, face)
+                original = small.copy()  # 肤色迁移需要原图作为参考
+                for face in get_many_faces(self.analyser, small):
+                    small = self.swapper.swap(small, src, face)
+                    if self.match_skin:
+                        try:
+                            from .color_transfer import blend_skintone
+                            small = blend_skintone(
+                                original, small, face.bbox,
+                                strength=self.skin_strength,
+                            )
+                        except Exception:  # noqa: BLE001 - 肤色迁移失败不影响换脸
+                            pass
                 elapsed = time.perf_counter() - t0
                 fps = fps * 0.9 + 0.1 / elapsed if elapsed > 0 else fps
+
+                # 放大回原始分辨率用于显示/输出
+                if scale != 1.0:
+                    frame = cv2.resize(small, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    frame = small
 
                 # 首次拿到真实帧尺寸后再开虚拟摄像头（用实际分辨率而非请求值）
                 if self.virtual_cam and vcam is None:

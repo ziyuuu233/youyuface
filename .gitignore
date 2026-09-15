@@ -2,5 +2,11 @@ venv/
 __pycache__/
 *.pyc
 models/
-output.jpg
 .vscode/
+
+# 运行产物 / 日志
+*.jpg
+*.jpeg
+*.png
+*.log
+!assets/*.jpg

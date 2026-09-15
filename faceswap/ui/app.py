@@ -55,10 +55,18 @@ class FaceSwapApp:
 
         ttk.Separator(left).pack(fill="x", pady=10)
 
-        # 摄像头编号
-        ttk.Label(left, text="摄像头编号").pack(anchor="w")
+        # 摄像头源：支持本地编号 0/1/2 或手机摄像头 URL
+        ttk.Label(left, text="摄像头源（编号或手机流地址）").pack(anchor="w")
         self.camera_var = tk.StringVar(value="0")
-        ttk.Spinbox(left, from_=0, to=9, textvariable=self.camera_var, width=5).pack(anchor="w", pady=(0, 6))
+        ttk.Entry(left, textvariable=self.camera_var, width=20).pack(fill="x", pady=(0, 2))
+        ttk.Label(
+            left,
+            text="本地摄像头填 0/1/2；手机摄像头填 URL\n例如 http://192.168.1.5:8080/video",
+            foreground="gray",
+            font=("", 8),
+            wraplength=260,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
 
         # 计算后端
         ttk.Label(left, text="计算后端").pack(anchor="w")
@@ -69,12 +77,41 @@ class FaceSwapApp:
             state="readonly", width=8,
         ).pack(anchor="w", pady=(0, 6))
 
+        # 处理分辨率（降分辨率可提升手机流帧率）
+        ttk.Label(left, text="处理分辨率（手机流建议选 640）").pack(anchor="w")
+        self.process_width_var = tk.StringVar(value="原始")
+        ttk.Combobox(
+            left, textvariable=self.process_width_var,
+            values=["原始", "960", "640", "480"],
+            state="readonly", width=8,
+        ).pack(anchor="w", pady=(0, 6))
+
+        # 跳帧开关
+        self.skip_frames_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            left, text="网络流跳帧（降低延迟）",
+            variable=self.skip_frames_var,
+        ).pack(anchor="w", pady=(0, 6))
+
         # 虚拟摄像头开关
         self.virtual_cam_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             left, text="启用虚拟摄像头（推送到会议/直播软件）",
             variable=self.virtual_cam_var,
         ).pack(anchor="w", pady=4)
+
+        # 肤色匹配开关 + 强度
+        self.match_skin_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            left, text="肤色跟随目标（让换脸肤色贴合画面）",
+            variable=self.match_skin_var,
+        ).pack(anchor="w", pady=(8, 2))
+        ttk.Label(left, text="肤色匹配强度").pack(anchor="w")
+        self.skin_strength_var = tk.DoubleVar(value=0.8)
+        ttk.Scale(
+            left, from_=0.0, to=1.0, variable=self.skin_strength_var,
+            orient="horizontal",
+        ).pack(fill="x", pady=(0, 4))
 
         # 启动/停止
         btn_frame = ttk.Frame(left)
@@ -137,6 +174,10 @@ class FaceSwapApp:
             messagebox.showerror("图片加载失败", str(e))
 
     # ---------------- 启动 / 停止 ----------------
+    def _parse_process_width(self) -> int:
+        v = self.process_width_var.get().strip()
+        return 0 if v == "原始" else int(v)
+
     def _start(self):
         if not self.source_path:
             messagebox.showwarning("提示", "请先选择源人脸图片")
@@ -163,9 +204,13 @@ class FaceSwapApp:
 
             pipeline = LivePipeline(
                 analyser, swapper, source_face,
-                camera_index=int(self.camera_var.get()),
+                camera_index=self.camera_var.get().strip(),
                 virtual_cam=self.virtual_cam_var.get(),
                 on_frame=self._on_frame,
+                match_skin=self.match_skin_var.get(),
+                skin_strength=self.skin_strength_var.get(),
+                process_width=self._parse_process_width(),
+                skip_frames=self.skip_frames_var.get(),
             )
             self.pipeline = pipeline
             self.root.after(0, lambda: self.status.config(text="预览中"))
@@ -175,23 +220,41 @@ class FaceSwapApp:
         except Exception as e:  # noqa: BLE001 - GUI 层捕获所有错误并提示
             import traceback
             traceback.print_exc()
-            self.root.after(0, lambda: self._on_pipeline_error(str(e)))
+            err_msg = str(e)  # 先把异常信息存成普通变量，避免 lambda 闭包访问不到 e
+            self.root.after(0, lambda: self._on_pipeline_error(err_msg))
 
     def _on_frame(self, frame_bgr: np.ndarray, fps: float, vcam_on: bool):
-        """流水线回调：把帧转成 PhotoImage 并通过 root.after 切回主线程渲染。"""
-        # BGR -> RGB -> PIL -> 缩放到预览尺寸 -> PhotoImage
+        """流水线回调：把帧转成 PIL 图像并切回主线程渲染（缩放由主线程按画布实际尺寸完成）。"""
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
-        img.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
         # 必须在主线程更新控件
-        self.root.after(0, lambda: self._render_preview(photo, fps, vcam_on))
+        self.root.after(0, lambda: self._render_preview(img, fps, vcam_on))
 
-    def _render_preview(self, photo, fps: float, vcam_on: bool):
-        self._preview_img = photo  # 持有引用防 GC
+    def _render_preview(self, img: Image.Image, fps: float, vcam_on: bool):
+        # 运行中实时同步参数到 pipeline
+        if self.pipeline is not None:
+            self.pipeline.match_skin = self.match_skin_var.get()
+            self.pipeline.skin_strength = self.skin_strength_var.get()
+            self.pipeline.process_width = self._parse_process_width()
+            self.pipeline.skip_frames = self.skip_frames_var.get()
+
+        # 读取画布当前实际大小（窗口缩放后会变化），等比缩放并居中（contain）
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw < 10 or ch < 10:  # 尚未完成布局时的回退值
+            cw, ch = PREVIEW_W, PREVIEW_H
+
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        dw = max(1, int(iw * scale))
+        dh = max(1, int(ih * scale))
+        # 视频预览用双线性，比 LANCZOS 快很多，对观感几乎无影响
+        resized = img.resize((dw, dh), Image.BILINEAR)
+
+        self._preview_img = ImageTk.PhotoImage(resized)  # 持有引用防 GC
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(
-            PREVIEW_W // 2, PREVIEW_H // 2, image=photo, anchor="center"
+            cw // 2, ch // 2, image=self._preview_img, anchor="center"
         )
         self.fps_var.set(f"FPS: {fps:.1f}" + ("  |  虚拟摄像头: 开" if vcam_on else ""))
 

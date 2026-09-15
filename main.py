@@ -12,12 +12,65 @@ import os
 import sys
 
 import cv2
+import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 INSWAPPER_PATH = os.path.join(MODELS_DIR, "inswapper_128_fp16.onnx")
 
 PROVIDER_PRIORITY = ["CUDAExecutionProvider", "DmlExecutionProvider"]
+
+DISCLAIMER = """\
+【免责声明 / 使用须知】
+
+1. 本软件仅供学习、研究与技术交流使用。
+2. 严禁将本软件用于任何违法违规活动，包括但不限于：
+   - 诈骗、敲诈勒索
+   - 诽谤、侮辱、侵犯他人名誉权
+   - 未经同意换用他人肖像，侵犯肖像权与隐私权
+   - 伪造身份、制作虚假证据
+   - 制作、传播色情低俗内容
+   - 其他违反法律法规或公序良俗的行为
+3. 使用本软件换用真人肖像前，必须取得肖像权人的明确同意，
+   并在发布、传播时标注"AI 换脸"等显著标识。
+4. 因使用本软件产生的一切法律责任与后果，均由使用者自行承担，
+   软件作者不承担任何连带责任。
+
+使用本软件即表示您已阅读、理解并同意以上条款。
+如不同意，请立即停止使用并关闭本软件。
+"""
+
+
+def show_disclaimer_gui(root) -> bool:
+    """GUI 模式下弹出免责声明，用户必须同意才能继续。"""
+    from tkinter import messagebox
+
+    return messagebox.askyesno(
+        "免责声明",
+        DISCLAIMER,
+        icon="warning",
+    )
+
+
+def show_disclaimer_cli() -> bool:
+    """命令行模式下打印免责声明并要求确认。"""
+    print(DISCLAIMER)
+    try:
+        ans = input("请输入 Y 表示同意以上条款后继续，其他任意键退出: ").strip().lower()
+    except EOFError:
+        return False
+    return ans == "y"
+
+
+def imread_unicode(path: str) -> np.ndarray:
+    """支持中文/Unicode 路径的 cv2.imread 替代实现。"""
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
 def resolve_providers(choice: str) -> list:
@@ -56,7 +109,7 @@ def load_models(provider_choice: str):
 
 def make_source(analyser, source_path: str):
     """读取源脸图片，提取主脸（含 normed_embedding，换脸外观来源）。"""
-    img = cv2.imread(source_path)
+    img = imread_unicode(source_path)
     if img is None:
         raise RuntimeError(f"无法读取源图片: {source_path}")
     from faceswap.core.face_analyser import get_one_face
@@ -74,7 +127,7 @@ def run_image_mode(args):
 
     analyser, swapper, _ = load_models(args.provider)
     source_face = make_source(analyser, args.source)
-    target = cv2.imread(args.target)
+    target = imread_unicode(args.target)
     if target is None:
         raise RuntimeError(f"无法读取目标图片: {args.target}")
 
@@ -125,8 +178,19 @@ def main():
         from faceswap.ui.app import FaceSwapApp
 
         root = tk.Tk()
+        root.withdraw()  # 先隐藏主窗口，等免责声明处理完再显示
+        if not show_disclaimer_gui(root):
+            print("您未同意免责条款，程序退出。")
+            root.destroy()
+            return
+        root.deiconify()
         FaceSwapApp(root)
         root.mainloop()
+        return
+
+    # 命令行模式也需确认免责条款
+    if not show_disclaimer_cli():
+        print("您未同意免责条款，程序退出。")
         return
 
     if args.target:

@@ -21,6 +21,70 @@ def swap_on_image(analyser, swapper, source_face, target_img):
     return out
 
 
+class ThreadedCapture:
+    """后台持续采集线程，只保留最新一帧。
+
+    解决网络流延迟的核心：换脸一帧耗时 100ms+，若在处理线程里同步 read()，
+    OpenCV 内部缓冲会持续堆积旧帧，画面延迟越来越大。采集线程不停 read()
+    把缓冲排空，处理线程永远拿最新帧；断线时自动重连。
+    """
+
+    def __init__(self, opener):
+        self._opener = opener
+        self._lock = threading.Lock()
+        self._frame = None
+        self._frame_id = 0
+        self._stopped = False
+        self.connected = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        cap = None
+        while not self._stopped:
+            try:
+                cap = self._opener()
+                self.connected = True
+            except Exception as e:  # noqa: BLE001 - 打开失败后重试
+                print(f"[camera] 连接失败，1 秒后重试: {e}", flush=True)
+                self.connected = False
+                time.sleep(1.0)
+                continue
+
+            fail_count = 0
+            while not self._stopped:
+                ok, frame = cap.read()
+                if not ok:
+                    fail_count += 1
+                    if fail_count > 30:
+                        print("[camera] 视频流中断，尝试重连...", flush=True)
+                        break
+                    time.sleep(0.02)
+                    continue
+                fail_count = 0
+                with self._lock:
+                    self._frame = frame
+                    self._frame_id += 1
+            try:
+                cap.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self.connected = False
+            if not self._stopped:
+                time.sleep(0.5)
+
+    def read_new(self, last_id: int):
+        """返回 (新帧id, 帧)；没有比 last_id 更新的帧时返回 (last_id, None)。"""
+        with self._lock:
+            if self._frame is None or self._frame_id == last_id:
+                return last_id, None
+            return self._frame_id, self._frame
+
+    def release(self):
+        self._stopped = True
+        self._thread.join(timeout=3)
+
+
 class LivePipeline:
     """摄像头实时预览。run() 在循环内逐帧处理，按 q 或 stop_event 退出。
 
@@ -126,23 +190,40 @@ class LivePipeline:
             return None
 
     def run(self, stop_event=None, show: bool = True):
-        cap = self._open_camera()
+        # 网络流用独立采集线程持续排空缓冲，处理线程只取最新帧
+        threaded = self._is_url and self.skip_frames
+        if threaded:
+            capture = ThreadedCapture(self._open_camera)
+            # 等待首帧（最多 15 秒）
+            wait_t = 0.0
+            while not stop_event.is_set() and wait_t < 15:
+                fid, frame = capture.read_new(0)
+                if frame is not None:
+                    break
+                time.sleep(0.1)
+                wait_t += 0.1
+            else:
+                capture.release()
+                raise RuntimeError(f"连接摄像头超时: {self.camera_index}")
+        else:
+            capture = self._open_camera()
+
         vcam = None
         fps = 0.0
         use_gui = self.on_frame is not None
+        last_frame_id = 0
         try:
             while stop_event is None or not stop_event.is_set():
-                # 网络流跳帧：丢掉积压的旧帧，只取最新一帧，降低延迟
-                if self._is_url and self.skip_frames:
-                    # grab 多次丢弃缓冲区里的旧帧（grab 只解码不取出，速度快）
-                    for _ in range(2):
-                        if not cap.grab():
-                            break
-                    ok, frame = cap.retrieve()
+                if threaded:
+                    # 只处理采集线程拿到的最新帧；没有新帧时短暂让出 CPU
+                    last_frame_id, frame = capture.read_new(last_frame_id)
+                    if frame is None:
+                        time.sleep(0.005)
+                        continue
                 else:
-                    ok, frame = cap.read()
-                if not ok:
-                    continue
+                    ok, frame = capture.read()
+                    if not ok:
+                        continue
                 if self.mirror:
                     frame = cv2.flip(frame, 1)
 
@@ -211,7 +292,7 @@ class LivePipeline:
 
                 self.status["fps"] = fps
         finally:
-            cap.release()
+            capture.release()
             if vcam is not None:
                 vcam.close()
             cv2.destroyAllWindows()

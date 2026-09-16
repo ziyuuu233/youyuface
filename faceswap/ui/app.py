@@ -1,9 +1,9 @@
 """Tkinter GUI：左侧源人脸缩略图与参数控件，右侧内嵌实时视频预览。
 
-设计要点（线程安全）：
-- 换脸流水线跑在后台线程，通过 on_frame 回调把 (frame_bgr, fps, vcam_on) 交给 GUI。
-- 回调内不直接操作 Tk 控件，而是用 root.after(0, ...) 把渲染切回主线程。
-- PhotoImage 必须持有引用，否则被 GC 回收导致画面空白。
+设计要点（线程安全 + 低卡顿）：
+- 换脸流水线跑在后台线程，只把最新帧写入"帧槽"（带锁），不排队。
+- 主线程用 after 定时轮询帧槽，有新帧才渲染，避免回调堆积。
+- Canvas 图像 item 只创建一次，之后 itemconfig 复用，不每帧 delete/create。
 """
 
 import threading
@@ -16,6 +16,7 @@ from PIL import Image, ImageTk
 
 PREVIEW_W = 640
 PREVIEW_H = 360
+UI_POLL_MS = 15  # 主线程轮询间隔（约 60fps 上限，实际跟随后台处理帧率）
 
 
 class FaceSwapApp:
@@ -34,9 +35,18 @@ class FaceSwapApp:
         # 必须持有 PhotoImage 引用，防止被 GC 回收
         self._preview_img = None
         self._source_thumb = None
+        # 预览帧槽：后台线程只写最新帧，主线程定时取（只保留最新，不积压）
+        self._frame_slot = None
+        self._frame_slot_lock = threading.Lock()
+        self._frame_seq = 0  # 帧序号，主线程用来判断有没有新帧
+        self._last_rendered_seq = -1
+        self._canvas_item = None  # 复用同一个 Canvas 图像 item
+        self._last_fps_text = ""
 
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 启动主线程 UI 轮询（一直存在，没新帧时不渲染）
+        self.root.after(UI_POLL_MS, self._ui_poll)
 
     # ---------------- UI 布局 ----------------
     def _build_ui(self):
@@ -224,13 +234,24 @@ class FaceSwapApp:
             self.root.after(0, lambda: self._on_pipeline_error(err_msg))
 
     def _on_frame(self, frame_bgr: np.ndarray, fps: float, vcam_on: bool):
-        """流水线回调：把帧转成 PIL 图像并切回主线程渲染（缩放由主线程按画布实际尺寸完成）。"""
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        # 必须在主线程更新控件
-        self.root.after(0, lambda: self._render_preview(img, fps, vcam_on))
+        """后台线程回调：只覆盖帧槽（永远只保留最新一帧），不调度 UI。"""
+        with self._frame_slot_lock:
+            self._frame_slot = (frame_bgr, fps, vcam_on)
+            self._frame_seq += 1
 
-    def _render_preview(self, img: Image.Image, fps: float, vcam_on: bool):
+    def _ui_poll(self):
+        """主线程定时执行：有新帧才渲染，避免回调堆积。"""
+        try:
+            with self._frame_slot_lock:
+                seq = self._frame_seq
+                slot = self._frame_slot
+            if seq != self._last_rendered_seq and slot is not None:
+                self._last_rendered_seq = seq
+                self._render_preview(slot[0], slot[1], slot[2])
+        finally:
+            self.root.after(UI_POLL_MS, self._ui_poll)
+
+    def _render_preview(self, frame_bgr: np.ndarray, fps: float, vcam_on: bool):
         # 运行中实时同步参数到 pipeline
         if self.pipeline is not None:
             self.pipeline.match_skin = self.match_skin_var.get()
@@ -244,19 +265,29 @@ class FaceSwapApp:
         if cw < 10 or ch < 10:  # 尚未完成布局时的回退值
             cw, ch = PREVIEW_W, PREVIEW_H
 
-        iw, ih = img.size
+        ih, iw = frame_bgr.shape[:2]
         scale = min(cw / iw, ch / ih)
         dw = max(1, int(iw * scale))
         dh = max(1, int(ih * scale))
-        # 视频预览用双线性，比 LANCZOS 快很多，对观感几乎无影响
-        resized = img.resize((dw, dh), Image.BILINEAR)
 
-        self._preview_img = ImageTk.PhotoImage(resized)  # 持有引用防 GC
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(
-            cw // 2, ch // 2, image=self._preview_img, anchor="center"
-        )
-        self.fps_var.set(f"FPS: {fps:.1f}" + ("  |  虚拟摄像头: 开" if vcam_on else ""))
+        # BGR->RGB + 缩放一次完成（cv2 比 PIL 快），再包成 PhotoImage
+        resized = cv2.resize(frame_bgr, (dw, dh), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self._preview_img = ImageTk.PhotoImage(Image.fromarray(rgb))  # 持有引用防 GC
+
+        # 复用同一个 Canvas item，不每帧 delete/create（减少 GC 抖动）
+        if self._canvas_item is None:
+            self._canvas_item = self.preview_canvas.create_image(
+                cw // 2, ch // 2, image=self._preview_img, anchor="center"
+            )
+        else:
+            self.preview_canvas.coords(self._canvas_item, cw // 2, ch // 2)
+            self.preview_canvas.itemconfig(self._canvas_item, image=self._preview_img)
+
+        fps_text = f"FPS: {fps:.1f}" + ("  |  虚拟摄像头: 开" if vcam_on else "")
+        if fps_text != self._last_fps_text:  # 文字没变就不刷新控件
+            self._last_fps_text = fps_text
+            self.fps_var.set(fps_text)
 
     def _stop(self):
         if self.stop_event:

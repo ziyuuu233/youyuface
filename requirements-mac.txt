@@ -1,0 +1,15 @@
+# macOS 版依赖（与 Windows 版的区别：
+#   - onnxruntime 替代 onnxruntime-directml（DirectML 是 Windows 专用）
+#   - insightface 用 PyPI 源码包编译，不使用 Windows 预编译 wheel）
+# 注意：insightface 源码编译需要 C++ 编译器，macOS 安装 Xcode Command Line Tools 即可：
+#   xcode-select --install
+numpy==1.26.4
+opencv-python==4.9.0.80
+albumentations==1.3.1
+ml_dtypes<0.6
+# macOS 用标准 onnxruntime；Apple Silicon (M1/M2/M3) 可选 CoreML 加速
+onnxruntime==1.19.2
+# insightface 从 PyPI 源码安装（macOS 无预编译 wheel）
+insightface==0.7.3
+# 虚拟摄像头（macOS 需安装 OBS Studio 及其虚拟摄像头插件）
+pyvirtualcam==0.15.0

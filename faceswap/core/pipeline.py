@@ -148,9 +148,11 @@ class LivePipeline:
 
     def _open_camera(self) -> cv2.VideoCapture:
         """打开摄像头。camera_index 支持：
-        - 整数：本地摄像头编号（用 DSHOW，设置分辨率）
+        - 整数：本地摄像头编号（Windows 用 DSHOW，macOS 用 AVFoundation）
         - 字符串 URL：手机摄像头 App 输出的 HTTP MJPEG / RTSP 流
         """
+        import platform as _pf
+
         src = self.camera_index
         is_url = isinstance(src, str) and (
             src.startswith(("http://", "https://", "rtsp://", "rtmp://"))
@@ -161,10 +163,14 @@ class LivePipeline:
             # 网络流关键优化：缓冲区只留 1 帧，避免旧帧堆积导致高延迟
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
-            # 本地摄像头：Windows 用 DSHOW 启动更快；MJPG 保证 720p 下高帧率
             idx = int(src)
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            if _pf.system() == "Windows":
+                # Windows：用 DSHOW 启动更快；MJPG 保证 720p 下高帧率
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            else:
+                # macOS / Linux：AVFoundation 自动选择，不传 backend 标志
+                cap = cv2.VideoCapture(idx)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 

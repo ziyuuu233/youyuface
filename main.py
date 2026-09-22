@@ -18,7 +18,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 INSWAPPER_PATH = os.path.join(MODELS_DIR, "inswapper_128_fp16.onnx")
 
-PROVIDER_PRIORITY = ["CUDAExecutionProvider", "DmlExecutionProvider"]
+import platform
+
+PROVIDER_PRIORITY = ["CUDAExecutionProvider", "DmlExecutionProvider", "CoreMLExecutionProvider"]
 
 DISCLAIMER = """\
 【免责声明 / 使用须知】
@@ -83,7 +85,12 @@ def resolve_providers(choice: str) -> list:
     if choice == "cuda":
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     if choice == "dml":
-        return ["DmlExecutionProvider"]
+        if platform.system() == "Windows":
+            return ["DmlExecutionProvider"]
+        # macOS/Linux 无 DirectML，退回 CPU
+        return ["CPUExecutionProvider"]
+    if choice == "coreml":
+        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     # auto：按优先级选第一个可用的 GPU 后端
     for p in PROVIDER_PRIORITY:
         if p in available:
@@ -165,7 +172,7 @@ def main():
     )
     parser.add_argument(
         "-p", "--provider",
-        choices=["auto", "cuda", "dml", "cpu"],
+        choices=["auto", "cuda", "dml", "coreml", "cpu"],
         default="auto",
         help="计算后端：auto 自动选 GPU，否则退回 CPU",
     )

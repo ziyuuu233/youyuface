@@ -78,12 +78,17 @@ class FaceSwapApp:
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
 
-        # 计算后端
+        # 计算后端（macOS 显示 coreml，Windows 显示 dml）
+        import platform as _pf
         ttk.Label(left, text="计算后端").pack(anchor="w")
         self.provider_var = tk.StringVar(value=self.default_provider)
+        if _pf.system() == "Darwin":
+            backend_choices = ["auto", "coreml", "cpu"]
+        else:
+            backend_choices = ["auto", "cuda", "dml", "cpu"]
         ttk.Combobox(
             left, textvariable=self.provider_var,
-            values=["auto", "cuda", "dml", "cpu"],
+            values=backend_choices,
             state="readonly", width=8,
         ).pack(anchor="w", pady=(0, 6))
 
